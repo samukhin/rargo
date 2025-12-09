@@ -292,7 +292,7 @@ func (w *RarWriter) Flush() error {
 	return w.writer.Flush()
 }
 
-// writeSignature writes the RAR 5.0 signature.
+// writeSignature записывает сигнатуру RAR 5.0.
 func (w *RarWriter) writeSignature() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -300,11 +300,11 @@ func (w *RarWriter) writeSignature() error {
 	return err
 }
 
-// writeMainHeader writes the main archive header.
+// writeMainHeader записывает главный заголовок архива.
 func (w *RarWriter) writeMainHeader() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	headerData := []byte{HeaderTypeMain, 0, 0} // Type: Main, Flags: 0, Extra: 0
+	headerData := []byte{HeaderTypeMain, 0, 0} // Тип: Главный, Флаги: 0, Extra: 0
 	headerSizeVint := encodeVint(len(headerData))
 	crcData := append(headerSizeVint, headerData...)
 	headerCRC := computeCRC32(crcData)
@@ -366,7 +366,7 @@ func buildHeaderParts(headerType, flags, dataSize, fileFlags, unpackedSize, attr
 	return headerData
 }
 
-// writeHeader writes the header data with CRC.
+// writeHeader записывает данные заголовка с CRC.
 func (w *RarWriter) writeHeader(headerData []byte) error {
 	headerSizeVint := encodeVint(len(headerData))
 	crcData := append(headerSizeVint, headerData...)
@@ -385,13 +385,13 @@ func (w *RarWriter) writeHeader(headerData []byte) error {
 	return nil
 }
 
-// buildHeader builds and writes a file or directory header.
+// buildHeader строит и записывает заголовок файла или директории.
 func (w *RarWriter) buildHeader(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen int, name []byte, extraData []byte) error {
 	headerData := buildHeaderParts(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen, name, extraData)
 	return w.writeHeader(headerData)
 }
 
-// writeFileHeader writes a file header and data.
+// writeFileHeader записывает заголовок файла и данные.
 func (w *RarWriter) writeFileHeader(path, relName string, password string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -545,7 +545,7 @@ func (w *RarWriter) writeFileHeader(path, relName string, password string) error
 	return nil
 }
 
-// writeDirHeader writes a directory header.
+// writeDirHeader записывает заголовок директории.
 func (w *RarWriter) writeDirHeader(path, relName string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -559,11 +559,11 @@ func (w *RarWriter) writeDirHeader(path, relName string) error {
 	return w.buildHeader(HeaderTypeFile, 0, 0, FileFlagDir|FileFlagMtime|FileFlagCRC, 0, 0, mtime, 0, 0, 0, nameLen, nameUTF8, nil)
 }
 
-// writeEndHeader writes the end of archive header.
+// writeEndHeader записывает заголовок конца архива.
 func (w *RarWriter) writeEndHeader() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	headerData := []byte{HeaderTypeEnd, 0, 0} // Тип: End, Флаги: 0, Extra: 0
+	headerData := []byte{HeaderTypeEnd, 0, 0} // Тип: Конец, Флаги: 0, Extra: 0
 	headerSizeVint := encodeVint(len(headerData))
 	crcData := append(headerSizeVint, headerData...)
 	headerCRC := computeCRC32(crcData)

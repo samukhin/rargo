@@ -6,6 +6,7 @@ import (
 	"testing"
 )
 
+// TestEncodeVint тестирует кодирование vint RAR 5.0.
 func TestEncodeVint(t *testing.T) {
 	tests := []struct {
 		value    int
@@ -29,6 +30,7 @@ func TestEncodeVint(t *testing.T) {
 	}
 }
 
+// TestComputeCRC32 тестирует вычисление CRC32.
 func TestComputeCRC32(t *testing.T) {
 	data := []byte("test")
 	expected := 0xD87F7E0C
@@ -38,6 +40,7 @@ func TestComputeCRC32(t *testing.T) {
 	}
 }
 
+// TestPkcs7Pad тестирует PKCS7 padding.
 func TestPkcs7Pad(t *testing.T) {
 	data := []byte("test")
 	blockSize := 16
@@ -51,6 +54,7 @@ func TestPkcs7Pad(t *testing.T) {
 	}
 }
 
+// TestEncryptData тестирует шифрование AES-256 CBC с PKCS7 padding.
 func TestEncryptData(t *testing.T) {
 	data := []byte("hello world test")
 	key := make([]byte, 32)
@@ -81,6 +85,7 @@ func TestEncryptData(t *testing.T) {
 	}
 }
 
+// BenchmarkEncryptData измеряет производительность шифрования 1MB данных.
 func BenchmarkEncryptData(b *testing.B) {
 	data := make([]byte, 1024*1024) // 1MB
 	for i := range data {
