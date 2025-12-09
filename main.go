@@ -7,9 +7,15 @@ package main
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
 	"log"
@@ -33,13 +39,6 @@ const (
 	FileFlagCRC   = 0x04 // Флаг CRC
 	FileFlagDir   = 0x01 // Флаг директории
 )
-
-// Пул буферов для эффективного переиспользования памяти.
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 64*1024) // 64KB buffer
-	},
-}
 
 // FileSize представляет размер файла для читаемости.
 type FileSize int64
@@ -113,6 +112,106 @@ func writeUint32(w io.Writer, value int) error {
 // computeCRC32 вычисляет CRC32 данных.
 func computeCRC32(data []byte) int {
 	return int(crc32.ChecksumIEEE(data) & 0xFFFFFFFF)
+}
+
+// deriveKey генерирует ключ AES-256 из пароля с PBKDF2.
+func deriveKey(password string, salt []byte, iterations int) []byte {
+	return pbkdf2([]byte(password), salt, iterations, 32, sha256.New)
+}
+
+// pbkdf2 реализует PBKDF2 с HMAC.
+func pbkdf2(password, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
+	prf := hmac.New(h, password)
+	hLen := prf.Size()
+	if keyLen > (1<<32-1)*hLen {
+		panic("keyLen too long")
+	}
+	l := (keyLen + hLen - 1) / hLen
+	result := make([]byte, l*hLen)
+	for i := 1; i <= l; i++ {
+		prf.Reset()
+		prf.Write(salt)
+		intI := make([]byte, 4)
+		binary.BigEndian.PutUint32(intI, uint32(i))
+		prf.Write(intI)
+		u := prf.Sum(nil)
+		copy(result[(i-1)*hLen:], u)
+		for j := 1; j < iter; j++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(nil)
+			for k := 0; k < hLen; k++ {
+				result[(i-1)*hLen+k] ^= u[k]
+			}
+		}
+	}
+	return result[:keyLen]
+}
+
+// pkcs7Pad добавляет PKCS7 padding.
+func pkcs7Pad(data []byte, blockSize int) []byte {
+	padding := blockSize - len(data)%blockSize
+	padtext := make([]byte, padding)
+	for i := range padtext {
+		padtext[i] = byte(padding)
+	}
+	return append(data, padtext...)
+}
+
+// encryptData шифрует данные AES-256 CBC.
+func encryptData(data, key, iv []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	padded := pkcs7Pad(data, aes.BlockSize)
+	ciphertext := make([]byte, len(padded))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, padded)
+	return ciphertext, nil
+}
+
+// createFileEncryptionRecord создаёт record для шифрования файла.
+func createFileEncryptionRecord(key, salt, iv []byte, kdfCount byte) []byte {
+	crcBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(crcBytes, uint32(computeCRC32(key[:8])))
+	checkValue := append(crcBytes, key[:8]...)
+	recordData := [][]byte{
+		encodeVint(0x01),   // Тип
+		{0},                // Версия
+		encodeVint(0x0001), // Флаги
+		{kdfCount},         // Счётчик KDF
+		salt,
+		iv,
+		checkValue,
+	}
+	var result []byte
+	for _, part := range recordData {
+		result = append(result, part...)
+	}
+	size := encodeVint(len(result))
+	return append(size, result...)
+}
+
+// encryptFileData шифрует данные файла и возвращает encrypted_data, extra_record.
+func encryptFileData(data []byte, password string) ([]byte, []byte, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, nil, err
+	}
+	iv := make([]byte, 16)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, nil, err
+	}
+	kdfCount := byte(19) // 2^19 = 524288 iterations
+	iterations := 1 << kdfCount
+	key := deriveKey(password, salt, iterations)
+	extraData := createFileEncryptionRecord(key, salt, iv, kdfCount)
+	encryptedData, err := encryptData(data, key, iv)
+	if err != nil {
+		return nil, nil, err
+	}
+	return encryptedData, extraData, nil
 }
 
 // getFilesAndDirs собирает все файлы и директории из заданных путей.
@@ -198,27 +297,41 @@ func (w *RarWriter) writeMainHeader() error {
 }
 
 // buildHeaderParts собирает части заголовка.
-func buildHeaderParts(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen int, name []byte) []byte {
-	headerParts := [][]byte{
-		{byte(headerType)},       // Тип заголовка
-		{byte(flags)},            // Флаги
-		encodeVint(dataSize),     // Размер данных (vint)
-		{byte(fileFlags)},        // Флаги файла
-		encodeVint(unpackedSize), // Размер распакованных данных (vint)
-		{byte(attributes)},       // Атрибуты
+func buildHeaderParts(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen int, name []byte, extraData []byte) []byte {
+	if len(extraData) > 0 {
+		flags |= 0x01 // extra area present
 	}
+	headerParts := [][]byte{
+		{byte(headerType)}, // Тип заголовка
+		{byte(flags)},      // Флаги
+	}
+	if flags&0x01 != 0 { // Область extra присутствует
+		headerParts = append(headerParts, encodeVint(len(extraData))) // Размер extra area (vint)
+	}
+	if flags&0x02 != 0 { // Область данных присутствует
+		headerParts = append(headerParts, encodeVint(dataSize)) // Размер данных (vint)
+	}
+	headerParts = append(headerParts,
+		[]byte{byte(fileFlags)},  // Флаги файла
+		encodeVint(unpackedSize), // Размер распакованных данных (vint)
+		[]byte{byte(attributes)}, // Атрибуты
+	)
 
-	// Mtime (4 bytes, little-endian)
+	// Mtime (4 байта, little-endian)
 	var tmp [4]byte
 	binary.LittleEndian.PutUint32(tmp[:], uint32(mtime))
 	headerParts = append(headerParts, tmp[:])
 
-	// CRC (4 bytes, little-endian)
+	// CRC (4 байта, little-endian)
 	binary.LittleEndian.PutUint32(tmp[:], uint32(crc))
 	headerParts = append(headerParts, tmp[:])
 
 	// Сжатие, ОС хоста, длина имени, имя
 	headerParts = append(headerParts, []byte{byte(compression)}, []byte{byte(hostOS)}, encodeVint(nameLen), name)
+
+	if len(extraData) > 0 {
+		headerParts = append(headerParts, extraData) // Область extra
+	}
 
 	// Собрать данные заголовка
 	headerData := make([]byte, 0, 64) // Предварительное выделение для эффективности
@@ -248,59 +361,50 @@ func (w *RarWriter) writeHeader(headerData []byte) error {
 }
 
 // buildHeader builds and writes a file or directory header.
-func (w *RarWriter) buildHeader(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen int, name []byte) error {
-	headerData := buildHeaderParts(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen, name)
+func (w *RarWriter) buildHeader(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen int, name []byte, extraData []byte) error {
+	headerData := buildHeaderParts(headerType, flags, dataSize, fileFlags, unpackedSize, attributes, mtime, crc, compression, hostOS, nameLen, name, extraData)
 	return w.writeHeader(headerData)
 }
 
 // writeFileHeader writes a file header and data.
-func (writer *RarWriter) writeFileHeader(path, relName string) error {
+func (writer *RarWriter) writeFileHeader(path, relName string, password string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file %s: %w", path, err)
 	}
-	unpackedSize := int(info.Size())
-	packedSize := unpackedSize // Режим store: packed == unpacked
+	originalSize := int(info.Size())
+	unpackedSize := originalSize
 	mtime := int(info.ModTime().Unix())
 	nameUTF8 := []byte(relName)
 	nameLen := len(nameUTF8)
 
-	// Вычислить CRC путём чтения файла
-	file, err := os.Open(path)
+	// Читаем данные файла
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return FileReadError{Path: path}
 	}
-	defer file.Close()
 
-	hasher := crc32.NewIEEE()
-	buf := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buf)
+	// Вычисляем CRC оригинальных данных
+	dataCRC := computeCRC32(data)
 
-	dataCRC := uint32(0)
-	for {
-		n, err := file.Read(buf)
-		if n > 0 {
-			hasher.Write(buf[:n])
-		}
-		if err == io.EOF {
-			break
-		}
+	var extraData []byte
+	if password != "" {
+		data, extraData, err = encryptFileData(data, password)
 		if err != nil {
-			return fmt.Errorf("failed to read file %s: %w", path, err)
+			return fmt.Errorf("failed to encrypt file data for %s: %w", path, err)
 		}
+		unpackedSize = originalSize // unpacked is original size
 	}
-	dataCRC = hasher.Sum32() & 0xFFFFFFFF
 
-	// Сбросить файл для копирования
-	file.Seek(0, 0)
+	packedSize := len(data)
 
-	err = writer.buildHeader(HeaderTypeFile, FlagDataArea, packedSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, int(dataCRC), 0, 0, nameLen, nameUTF8)
+	err = writer.buildHeader(HeaderTypeFile, FlagDataArea, packedSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, dataCRC, 0, 0, nameLen, nameUTF8, extraData)
 	if err != nil {
 		return fmt.Errorf("failed to write file header for %s: %w", path, err)
 	}
 
 	writer.mu.Lock()
-	_, err = io.Copy(writer.writer, file)
+	_, err = writer.writer.Write(data)
 	writer.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to write file data for %s: %w", path, err)
@@ -319,7 +423,7 @@ func (writer *RarWriter) writeDirHeader(path, relName string) error {
 	mtime := int(info.ModTime().Unix())
 	nameUTF8 := []byte(relName + "/")
 	nameLen := len(nameUTF8)
-	return writer.buildHeader(HeaderTypeFile, 0, 0, FileFlagDir|FileFlagMtime|FileFlagCRC, 0, 0, mtime, 0, 0, 0, nameLen, nameUTF8)
+	return writer.buildHeader(HeaderTypeFile, 0, 0, FileFlagDir|FileFlagMtime|FileFlagCRC, 0, 0, mtime, 0, 0, 0, nameLen, nameUTF8, nil)
 }
 
 // writeEndHeader writes the end of archive header.
@@ -348,7 +452,7 @@ func (w *RarWriter) writeEndHeader() error {
 // Пример:
 //
 //	err := CreateArchive("archive.rar", []string{"file1.txt", "dir/"}, true)
-func CreateArchive(archivePath string, paths []string, verbose bool) error {
+func CreateArchive(archivePath string, paths []string, verbose bool, password string) error {
 	filesAndDirs, err := getFilesAndDirs(paths)
 	if err != nil {
 		return err
@@ -411,7 +515,7 @@ func CreateArchive(archivePath string, paths []string, verbose bool) error {
 						return
 					}
 				} else {
-					if err := writer.writeFileHeader(p, relName); err != nil {
+					if err := writer.writeFileHeader(p, relName, password); err != nil {
 						errorsChan <- fmt.Errorf("failed to write file header for %s: %w", p, err)
 						return
 					}
@@ -461,15 +565,24 @@ func CreateArchive(archivePath string, paths []string, verbose bool) error {
 func main() {
 	args := os.Args[1:]
 	if len(args) < 3 || args[0] != "a" {
-		fmt.Println("Использование: rargo a archive.rar file1 [file2 ...] [--verbose]")
+		fmt.Println("Использование: rargo a archive.rar file1 [file2 ...] [--verbose] [--password PASS]")
 		os.Exit(1)
 	}
 	archivePath := args[1]
 	var paths []string
 	var verbose bool
+	var password string
 	for i := 2; i < len(args); i++ {
 		if args[i] == "--verbose" {
 			verbose = true
+		} else if args[i] == "--password" {
+			if i+1 < len(args) {
+				password = args[i+1]
+				i++
+			} else {
+				fmt.Println("Ошибка: --password требует значение")
+				os.Exit(1)
+			}
 		} else {
 			paths = append(paths, args[i])
 		}
@@ -479,7 +592,7 @@ func main() {
 		os.Exit(1)
 	}
 	start := time.Now()
-	err := CreateArchive(archivePath, paths, verbose)
+	err := CreateArchive(archivePath, paths, verbose, password)
 	if err != nil {
 		var ip *InvalidPathError
 		var fr *FileReadError
