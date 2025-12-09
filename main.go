@@ -20,10 +20,12 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -236,16 +238,30 @@ func getFilesAndDirs(paths []string) ([]string, error) {
 			return nil, InvalidPathError{Path: p}
 		}
 		if info.Mode().IsRegular() {
+			if info.Size() > 1<<40 { // 1TB limit
+				log.Printf("Warning: skipping large file %s (%d bytes)", absP, info.Size())
+				return nil, InvalidPathError{Path: p}
+			}
 			result = append(result, absP)
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			log.Printf("Warning: skipping symlink %s", absP)
 		} else if info.IsDir() {
 			result = append(result, absP)
 			err := filepath.Walk(absP, func(path string, info os.FileInfo, err error) error {
 				if err != nil {
 					return err
 				}
+				if info.Mode()&os.ModeSymlink != 0 {
+					log.Printf("Warning: skipping symlink %s", path)
+					return nil
+				}
 				if info.IsDir() {
 					result = append(result, path)
 				} else if info.Mode().IsRegular() {
+					if info.Size() > 1<<40 {
+						log.Printf("Warning: skipping large file %s (%d bytes)", path, info.Size())
+						return nil
+					}
 					result = append(result, path)
 				}
 				return nil
@@ -376,7 +392,7 @@ func (w *RarWriter) buildHeader(headerType, flags, dataSize, fileFlags, unpacked
 }
 
 // writeFileHeader writes a file header and data.
-func (writer *RarWriter) writeFileHeader(path, relName string, password string) error {
+func (w *RarWriter) writeFileHeader(path, relName string, password string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat file %s: %w", path, err)
@@ -406,14 +422,14 @@ func (writer *RarWriter) writeFileHeader(path, relName string, password string) 
 		}
 		packedSize = len(data)
 
-		err = writer.buildHeader(HeaderTypeFile, FlagDataArea, packedSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, dataCRC, 0, 0, nameLen, nameUTF8, extraData)
+		err = w.buildHeader(HeaderTypeFile, FlagDataArea, packedSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, dataCRC, 0, 0, nameLen, nameUTF8, extraData)
 		if err != nil {
 			return fmt.Errorf("failed to write file header for %s: %w", path, err)
 		}
 
-		writer.mu.Lock()
-		_, err = writer.writer.Write(data)
-		writer.mu.Unlock()
+		w.mu.Lock()
+		_, err = w.writer.Write(data)
+		w.mu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to write file data for %s: %w", path, err)
 		}
@@ -468,49 +484,59 @@ func (writer *RarWriter) writeFileHeader(path, relName string, password string) 
 			}
 			mode := cipher.NewCBCEncrypter(block, iv)
 
-			err = writer.buildHeader(HeaderTypeFile, FlagDataArea, originalSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, dataCRC, 0, 0, nameLen, nameUTF8, extraData)
+			err = w.buildHeader(HeaderTypeFile, FlagDataArea, originalSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, dataCRC, 0, 0, nameLen, nameUTF8, extraData)
 			if err != nil {
 				return fmt.Errorf("failed to write file header for %s: %w", path, err)
 			}
 
-			writer.mu.Lock()
+			w.mu.Lock()
+			// Накопительный буфер для паддинга
+			encryptBuf := make([]byte, 0, 64*1024)
 			for {
 				n, err := file.Read(buf)
 				if n > 0 {
-					// Шифруем chunk (предполагаем кратность 16, иначе паддинг)
-					if n%16 != 0 {
-						// Для простоты, шифруем только полные блоки, но это не идеально
-						// В реальности нужно накапливать и паддить последний chunk
-						mode.CryptBlocks(buf[:n], buf[:n])
-					} else {
-						mode.CryptBlocks(buf[:n], buf[:n])
-					}
-					_, err = writer.writer.Write(buf[:n])
-					if err != nil {
-						writer.mu.Unlock()
-						return fmt.Errorf("failed to write encrypted data for %s: %w", path, err)
+					encryptBuf = append(encryptBuf, buf[:n]...)
+					// Шифруем полные блоки
+					for len(encryptBuf) >= 16 {
+						mode.CryptBlocks(encryptBuf[:16], encryptBuf[:16])
+						_, writeErr := w.writer.Write(encryptBuf[:16])
+						if writeErr != nil {
+							w.mu.Unlock()
+							return fmt.Errorf("failed to write encrypted data for %s: %w", path, writeErr)
+						}
+						encryptBuf = encryptBuf[16:]
 					}
 				}
 				if err == io.EOF {
+					// Паддим и шифруем последний chunk
+					if len(encryptBuf) > 0 {
+						padded := pkcs7Pad(encryptBuf, 16)
+						mode.CryptBlocks(padded, padded)
+						_, writeErr := w.writer.Write(padded)
+						if writeErr != nil {
+							w.mu.Unlock()
+							return fmt.Errorf("failed to write encrypted data for %s: %w", path, writeErr)
+						}
+					}
 					break
 				}
 				if err != nil {
-					writer.mu.Unlock()
+					w.mu.Unlock()
 					return fmt.Errorf("failed to read file %s: %w", path, err)
 				}
 			}
-			writer.mu.Unlock()
+			w.mu.Unlock()
 		} else {
 			// Без шифрования: просто копируем
 			packedSize = originalSize
-			err = writer.buildHeader(HeaderTypeFile, FlagDataArea, packedSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, dataCRC, 0, 0, nameLen, nameUTF8, extraData)
+			err = w.buildHeader(HeaderTypeFile, FlagDataArea, packedSize, FileFlagMtime|FileFlagCRC, unpackedSize, 0, mtime, dataCRC, 0, 0, nameLen, nameUTF8, extraData)
 			if err != nil {
 				return fmt.Errorf("failed to write file header for %s: %w", path, err)
 			}
 
-			writer.mu.Lock()
-			_, err = io.Copy(writer.writer, file)
-			writer.mu.Unlock()
+			w.mu.Lock()
+			_, err = io.Copy(w.writer, file)
+			w.mu.Unlock()
 			if err != nil {
 				return fmt.Errorf("failed to write file data for %s: %w", path, err)
 			}
@@ -520,9 +546,9 @@ func (writer *RarWriter) writeFileHeader(path, relName string, password string) 
 }
 
 // writeDirHeader writes a directory header.
-func (writer *RarWriter) writeDirHeader(path, relName string) error {
-	writer.mu.Lock()
-	defer writer.mu.Unlock()
+func (w *RarWriter) writeDirHeader(path, relName string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("failed to stat dir %s: %w", path, err)
@@ -530,7 +556,7 @@ func (writer *RarWriter) writeDirHeader(path, relName string) error {
 	mtime := int(info.ModTime().Unix())
 	nameUTF8 := []byte(relName + "/")
 	nameLen := len(nameUTF8)
-	return writer.buildHeader(HeaderTypeFile, 0, 0, FileFlagDir|FileFlagMtime|FileFlagCRC, 0, 0, mtime, 0, 0, 0, nameLen, nameUTF8, nil)
+	return w.buildHeader(HeaderTypeFile, 0, 0, FileFlagDir|FileFlagMtime|FileFlagCRC, 0, 0, mtime, 0, 0, 0, nameLen, nameUTF8, nil)
 }
 
 // writeEndHeader writes the end of archive header.
@@ -698,6 +724,16 @@ func main() {
 		fmt.Println("Ошибка: укажите файлы для архивации")
 		os.Exit(1)
 	}
+
+	// Обработка прерываний для graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nОперация прервана пользователем. Очистка...")
+		os.Exit(1)
+	}()
+
 	start := time.Now()
 	err := CreateArchive(archivePath, paths, verbose, password)
 	if err != nil {

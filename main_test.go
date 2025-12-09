@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"testing"
 )
 
@@ -46,5 +48,54 @@ func TestPkcs7Pad(t *testing.T) {
 	}
 	if padded[len(padded)-1] != byte(expectedLen-len(data)) {
 		t.Errorf("padding byte %x, expected %x", padded[len(padded)-1], byte(expectedLen-len(data)))
+	}
+}
+
+func TestEncryptData(t *testing.T) {
+	data := []byte("hello world test")
+	key := make([]byte, 32)
+	iv := make([]byte, 16)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	for i := range iv {
+		iv[i] = byte(i + 32)
+	}
+	encrypted, err := encryptData(data, key, iv)
+	if err != nil {
+		t.Fatalf("encryptData failed: %v", err)
+	}
+	if len(encrypted) == 0 {
+		t.Error("encrypted data is empty")
+	}
+	// Decrypt to verify
+	block, _ := aes.NewCipher(key)
+	mode := cipher.NewCBCDecrypter(block, iv)
+	decrypted := make([]byte, len(encrypted))
+	mode.CryptBlocks(decrypted, encrypted)
+	// Remove padding
+	padding := int(decrypted[len(decrypted)-1])
+	decrypted = decrypted[:len(decrypted)-padding]
+	if string(decrypted) != string(data) {
+		t.Errorf("decryption failed: got %q, expected %q", decrypted, data)
+	}
+}
+
+func BenchmarkEncryptData(b *testing.B) {
+	data := make([]byte, 1024*1024) // 1MB
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	key := make([]byte, 32)
+	iv := make([]byte, 16)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	for i := range iv {
+		iv[i] = byte(i + 32)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = encryptData(data, key, iv)
 	}
 }
